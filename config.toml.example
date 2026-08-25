@@ -1,0 +1,9 @@
+# Copy this file to config.toml and fill in the paths for the machine
+# you're running on. config.toml is gitignored since these paths are
+# machine-specific (local Mac vs gadi).
+
+# Root containing uniform/ and posterior/ subdirs of trained model runs
+# (e.g. reg_arc/depth/<arch>/0/model_*.keras).
+# gadi:  /g/data/cm25/jw5893/dragons/output
+# local: /Users/james471/Desktop/PhD/Meraxes/Models
+models_dir = "/path/to/Models"
