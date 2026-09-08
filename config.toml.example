@@ -7,3 +7,10 @@
 # gadi:  /g/data/cm25/jw5893/dragons/output
 # local: /Users/james471/Desktop/PhD/Meraxes/Models
 models_dir = "/path/to/Models"
+
+# Root under which sampler runs write their output, one dir per
+# (flavour, architecture, repeat). Keep this off /home — a full sweep is
+# 24 UltraNest log dirs.
+# gadi:  /g/data/cm25/jw5893/dragons/inference
+# local: /Users/james471/Desktop/PhD/Meraxes/Inference
+inference_dir = "/path/to/Inference"

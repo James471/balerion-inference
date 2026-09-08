@@ -31,3 +31,20 @@ def load_config():
 def get_models_dir(cfg=None):
     cfg = cfg or load_config()
     return cfg["models_dir"]
+
+
+def get_inference_dir(cfg=None):
+    """Root under which each sampler run writes its own output directory.
+
+    Kept out of the repo (and off /home) because a full architecture sweep
+    writes one UltraNest log_dir per model, which is far more than a home
+    quota wants to hold.
+    """
+    cfg = cfg or load_config()
+    value = cfg.get("inference_dir")
+    if not value:
+        raise ValueError(
+            "config.toml is missing required key: inference_dir "
+            "(see config.toml.example)"
+        )
+    return value
