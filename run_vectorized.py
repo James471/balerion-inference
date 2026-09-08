@@ -1,45 +1,22 @@
+import argparse
 import json
 import time
 from pathlib import Path
-import sys
 
 import numpy as np
 import tensorflow as tf
 from ultranest import ReactiveNestedSampler
 
-from config import load_config, get_models_dir
+from config import load_config, get_models_dir, get_inference_dir
 
-# Under `mpirun`, this whole script runs once per rank. Ask MPI directly for
-# our own rank rather than relying on the sampler's mpi_rank attribute
-# (UltraNest sets that internally behind a broad try/except around its own
-# mpi4py import, so reading it back couples us to that internal fallback
-# instead of asking MPI directly). Falls back to rank 0 when mpi4py isn't
-# installed or the script isn't run under mpirun, so this works unchanged
-# in the single-process case.
-try:
-    from mpi4py import MPI
-    MPI_RANK = MPI.COMM_WORLD.Get_rank()
-except ImportError:
-    MPI_RANK = 0
-
-if len(sys.argv) > 1:
-    flag_arg = sys.argv[1].lower()
-    if flag_arg in {"u", "uniform", "true", "1"}:
-        flag_U = True
-    elif flag_arg in {"p", "posterior", "false", "0"}:
-        flag_U = False
-    else:
-        raise ValueError(f"Unrecognized emulator flag: {sys.argv[1]}")
-
-# Optional second CLI arg: cap on total likelihood calls, so a profiling run
-# stops at a known, repeatable point instead of running to full convergence
-# (or needing a Ctrl-C). Passed straight to sampler.run(max_ncalls=...).
-MAX_NCALLS = int(sys.argv[2]) if len(sys.argv) > 2 else 20000
+gpus = tf.config.list_physical_devices('GPU')
+use_gpu = len(gpus) > 0
+device = '/GPU:0' if use_gpu else '/CPU:0'
+print(f"GPUs visible to TensorFlow: {gpus}")
+print(f"Running emulator on: {device}")
 
 REDSHIFTS = (6, 7, 8, 9, 10)
 DATA_DIR = Path(__file__).resolve().parent / "data"
-OUTPUT_DIR = Path(__file__).resolve().parent / f"ultranest_output_vec_{'U' if flag_U else 'P'}"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 REDSHIFT_INDICES = {
     6: [[8.051645433238704,
@@ -68,23 +45,120 @@ REDSHIFT_INDICES = {
 }
 NUM_OUTPUTS = 23
 
-_ARCH = "32_64_128_256_512_512_512_512_256_128_64_32"
-_MODELS_DIR = get_models_dir(load_config())
+# Stand-in for a zero likelihood. UltraNest asserts that the likelihood is
+# finite on its start-up test draws, so a hard -inf rejection makes whether a
+# run even starts depend on which two points it happens to draw — which is a
+# coin flip that some of the smaller architectures lose. A number this negative
+# is rejected in favour of any real point just as surely as -inf, without
+# tripping that check or putting inf/nan through the residual arithmetic.
+LOG_ZERO = -1e100
 
+# Architecture used when --model is not given, i.e. the deepest one in the
+# sweep. The sweep scripts always pass --model explicitly.
+DEFAULT_ARCH = "32_64_128_256_512_512_512_512_256_128_64_32"
+DEFAULT_REPEAT = "0"
+
+# Keyed on flag_U. These are properties of the *training set*, not of the
+# network architecture, so they stay fixed as we sweep over architectures:
+# threshold_smf is the floor below which the emulator's SMF output is treated
+# as "no galaxies" (-inf) rather than a real number.
 EMULATOR_CONFIG = {
     True: {
-        "path": str(Path(_MODELS_DIR) / "uniform" / "reg_arc" / "depth" / _ARCH / "0"
-                    / f"model_reg_depth_{_ARCH}_0.keras"),
+        "flavour": "uniform",
         "regressor_inf_val": -6.3,
         "threshold_smf": -5.797041,
     },
     False: {
-        "path": str(Path(_MODELS_DIR) / "posterior" / "reg_arc" / "depth" / _ARCH / "0"
-                    / f"model_reg_depth_{_ARCH}_0.keras"),
+        "flavour": "posterior",
         "regressor_inf_val": -7.1,
         "threshold_smf": -6.6721025,
     },
 }
+
+
+def default_model_path(flavour, arch=DEFAULT_ARCH, repeat=DEFAULT_REPEAT):
+    return (Path(get_models_dir(load_config())) / flavour / "reg_arc" / "depth"
+            / arch / repeat / f"model_reg_depth_{arch}_{repeat}.keras")
+
+
+def parse_flag_u(value):
+    lowered = value.lower()
+    if lowered in {"u", "uniform", "true", "1"}:
+        return True
+    if lowered in {"p", "posterior", "false", "0"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Unrecognized emulator flag: {value}")
+
+
+def derive_run_id(model_path):
+    """(arch, repeat) for a model at .../depth/<arch>/<repeat>/model_*.keras.
+
+    <repeat> is balerion's StatisticalTest run index, not an RNG seed: it
+    retrains each architecture num_tests times and numbers them from 0.
+
+    Falls back to the filename stem when the path doesn't have that shape, so
+    an ad-hoc model outside the sweep tree still gets a usable output dir
+    instead of silently colliding with another run's.
+    """
+    repeat = model_path.parent.name
+    arch = model_path.parent.parent.name
+    if arch and repeat and repeat.isdigit() and all(part.isdigit() for part in arch.split("_")):
+        return arch, repeat
+    return model_path.stem, "0"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Nested sampling over a trained SMF emulator.",
+    )
+    parser.add_argument(
+        "flag", type=parse_flag_u,
+        help="which emulator flavour: u/uniform or p/posterior. Selects the "
+             "SMF threshold, and the model when --model is omitted.",
+    )
+    parser.add_argument(
+        "--model", type=Path, default=None,
+        help=f"path to the .keras emulator. Default: the {DEFAULT_ARCH} "
+             "architecture for this flavour.",
+    )
+    parser.add_argument(
+        "--max-ncalls", type=int, default=None,
+        help="cap on total likelihood calls, for repeatable profiling runs. "
+             "Omitted, the sampler runs to convergence.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="where to write the UltraNest log dir. Default: "
+             "<inference_dir>/<flavour>/<arch>/<repeat>.",
+    )
+    parser.add_argument(
+        "--resume", default="resume",
+        choices=("resume", "resume-similar", "overwrite", "subfolder"),
+        help="UltraNest resume mode. Default 'resume' so a job that hits the "
+             "walltime continues where it left off when resubmitted.",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+flag_U = args.flag
+FLAVOUR = EMULATOR_CONFIG[flag_U]["flavour"]
+MAX_NCALLS = args.max_ncalls
+
+MODEL_PATH = (args.model if args.model is not None
+              else default_model_path(FLAVOUR)).resolve()
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(f"No emulator at {MODEL_PATH}")
+
+ARCH, REPEAT = derive_run_id(MODEL_PATH)
+OUTPUT_DIR = (args.output_dir if args.output_dir is not None
+              else Path(get_inference_dir(load_config())) / FLAVOUR / ARCH / REPEAT)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print(f"flavour:   {FLAVOUR}")
+print(f"model:     {MODEL_PATH}")
+print(f"output:    {OUTPUT_DIR}")
+print(f"max_ncalls:{MAX_NCALLS if MAX_NCALLS is not None else ' run to convergence'}")
 
 PARAMETER_NAMES = [
     r"$\alpha_{\rm SF}$",
@@ -132,11 +206,10 @@ def load_data_by_redshift():
     return data_by_redshift
 
 
-def load_emulator(flag_U):
-    config = EMULATOR_CONFIG[flag_U]
-    emulator_path = config["path"]
-    threshold_smf = config["threshold_smf"]
-    emulator = tf.keras.models.load_model(emulator_path, compile=False)
+def load_emulator(flag_U, model_path):
+    threshold_smf = EMULATOR_CONFIG[flag_U]["threshold_smf"]
+    with tf.device(device):
+        emulator = tf.keras.models.load_model(str(model_path), compile=False)
     return emulator, threshold_smf
 
 
@@ -147,6 +220,51 @@ def build_inputs(theta):
     elif theta.ndim != 2:
         raise ValueError("theta must be 1D or 2D")
     return theta
+
+
+# --- the forward pass ------------------------------------------------------
+# Not emulator.predict(): that's a training-loop API which rebuilds a tf.data
+# pipeline, callback list and result aggregator per invocation, costing a flat
+# ~95ms whatever the architecture or batch size. UltraNest calls the likelihood
+# tens of thousands of times with a median batch of ~3-50 points, so that fixed
+# cost was ~94-101% of the first four runs' wall time at 0-11% GPU use.
+#
+# A plain eager call fixes most of that, but re-dispatches every layer from
+# Python, so its cost scales with depth: 4.4ms at 1 layer, 19.8ms at 12. A
+# tf.function traces the whole net into one graph and is nearly flat instead
+# (1.9ms -> 4.0ms), which matters because every run left in the sweep is
+# deeper than the ones already done.
+#
+# The catch is that a graph is tied to one input shape, and UltraNest varies
+# the batch size constantly -- an unpinned tf.function would retrace on nearly
+# every call and be slower than what it replaces. So keep one traced function
+# per batch size. Measured on a real 60k-call run: 91 distinct sizes, 72 of
+# them <= 100, and tracing pays for itself after ~8 calls at that size
+# (128ms to trace on the deepest net, ~16ms saved per call).
+_TRACED = {}
+
+# Bounds the cache if some future posterior explores far more distinct sizes
+# than we've seen. At ~1.9 MiB/graph on the deepest net this caps the cache
+# near 380 MiB, against a 128GB request that currently peaks at 2.4GB. Past
+# the cap we fall back to the eager call, so the worst case is exactly today's
+# performance rather than an unbounded memory climb.
+MAX_TRACED_SHAPES = 200
+
+
+def emulator_forward(emulator, x):
+    """Emulator outputs for x, shape (n_points, 10) -> (n_points, NUM_OUTPUTS)."""
+    x_tf = tf.constant(x, dtype=tf.float32)
+    n_points = x.shape[0]
+
+    traced = _TRACED.get(n_points)
+    if traced is None:
+        if len(_TRACED) >= MAX_TRACED_SHAPES:
+            return emulator(x_tf, training=False).numpy()
+        signature = [tf.TensorSpec(shape=(n_points, 10), dtype=tf.float32)]
+        traced = tf.function(
+            lambda t: emulator(t, training=False), input_signature=signature)
+        _TRACED[n_points] = traced
+    return traced(x_tf).numpy()
 
 
 # --- profiling instrumentation -------------------------------------------
@@ -168,12 +286,21 @@ def compute_normalized_residuals(theta, emulator, threshold_smf, data_by_redshif
     x = build_inputs(theta)
 
     t0 = time.perf_counter()
-    y_pred = emulator.predict(x, verbose=0)
+    with tf.device(device):
+        # See emulator_forward: traced graph per batch size, not .predict().
+        # Outputs agree with predict() to ~1e-6 relative -- float32
+        # kernel-path rounding -- with no change to the sub-threshold reject
+        # flags, checked across the real PARAMETER_BOUNDS volume.
+        y_pred = emulator_forward(emulator, x)
     t1 = time.perf_counter()
     PROFILE["t_predict"] += t1 - t0
 
-    mask = y_pred <= threshold_smf
-    y_pred = np.where(mask, -np.inf, y_pred)
+    # A prediction at or below the SMF floor means "no galaxies here", which
+    # the data contradicts, so the point is rejected outright. Flag it rather
+    # than propagating -inf through the residual arithmetic: log_likelihood
+    # substitutes a finite LOG_ZERO for these, and the inf/nan that -inf would
+    # produce here would poison the arithmetic and warn on every call.
+    invalid = np.any(y_pred <= threshold_smf, axis=1)
 
     residuals = np.zeros((x.shape[0], NUM_OUTPUTS), dtype=float)
     for z in REDSHIFTS:
@@ -197,19 +324,20 @@ def compute_normalized_residuals(theta, emulator, threshold_smf, data_by_redshif
     t2 = time.perf_counter()
     PROFILE["t_residuals"] += t2 - t1
 
-    return residuals
+    return residuals, invalid
 
 
 def log_likelihood(theta):
     t_start = time.perf_counter()
 
-    normalized_residual = compute_normalized_residuals(
+    normalized_residual, invalid = compute_normalized_residuals(
         theta,
         emulator,
         threshold_smf,
         data_by_redshift,
     )
     result = -0.5 * np.sum(normalized_residual**2, axis=1)
+    result = np.where(invalid, LOG_ZERO, result)
 
     PROFILE["n_calls"] += 1
     PROFILE["batch_sizes"].append(np.asarray(theta).shape[0] if np.asarray(theta).ndim == 2 else 1)
@@ -239,6 +367,12 @@ def print_profile_summary():
     print(f"  batch size  min/median/max: "
           f"{batch_sizes.min()}/{int(np.median(batch_sizes))}/{batch_sizes.max()}")
     print(f"  batch size  mean:           {batch_sizes.mean():.1f}")
+    # If traced shapes ever hits the cap, calls at new sizes are silently
+    # falling back to the eager path -- worth seeing rather than guessing.
+    distinct = len(set(batch_sizes.tolist()))
+    capped = " (AT CAP, extra sizes ran eager)" if len(_TRACED) >= MAX_TRACED_SHAPES else ""
+    print(f"  distinct batch sizes:       {distinct}")
+    print(f"  traced graphs cached:       {len(_TRACED)}/{MAX_TRACED_SHAPES}{capped}")
     print("-" * 60)
     print(f"  time in emulator.predict(): {t_predict:8.2f}s  ({100 * t_predict / t_total:5.1f}%)")
     print(f"  time in residual bookkeep:  {t_residuals:8.2f}s  ({100 * t_residuals / t_total:5.1f}%)")
@@ -268,35 +402,45 @@ def prior_transform(cube):
     return lower + cube * (upper - lower)
 
 
-output_dir = Path(OUTPUT_DIR)
-output_dir.mkdir(parents=True, exist_ok=True)
+output_dir = OUTPUT_DIR
 
 data_by_redshift = load_data_by_redshift()
-emulator, threshold_smf = load_emulator(flag_U)
+emulator, threshold_smf = load_emulator(flag_U, MODEL_PATH)
 
 sampler = ReactiveNestedSampler(
     PARAMETER_NAMES,
     log_likelihood,
     prior_transform,
     vectorized=True,
-    resume='overwrite',
+    resume=args.resume,
     log_dir=str(output_dir),
 )
 
 try:
-    result = sampler.run(max_ncalls=MAX_NCALLS)
+    run_kwargs = {} if MAX_NCALLS is None else {"max_ncalls": MAX_NCALLS}
+    result = sampler.run(**run_kwargs)
 finally:
-    # Under mpirun this script runs once per rank, and all ranks reach this
-    # point after sampler.run() returns. Only rank 0 prints/writes so we
-    # don't get N-way duplicated console output and N processes racing to
-    # write the same result.json.
-    if MPI_RANK == 0:
-        # Print even on Ctrl-C / an exception so a long run interrupted
-        # midway still tells us the call-count/batch-size/timing breakdown
-        # so far.
-        print_profile_summary()
+    # Print even on Ctrl-C / an exception so a long run interrupted
+    # midway still tells us the call-count/batch-size/timing breakdown
+    # so far.
+    print_profile_summary()
 
-if MPI_RANK == 0:
-    result_path = output_dir / "result.json"
-    with result_path.open("w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2, default=lambda value: value.tolist() if isinstance(value, np.ndarray) else None)
+# result.json is written only once sampler.run() has returned, so the sweep
+# scripts use its presence as the "this model is done" marker. Anything else
+# in output_dir is UltraNest's own resumable state.
+result_path = output_dir / "result.json"
+with result_path.open("w", encoding="utf-8") as handle:
+    json.dump(result, handle, indent=2, default=lambda value: value.tolist() if isinstance(value, np.ndarray) else None)
+
+with (output_dir / "run_info.json").open("w", encoding="utf-8") as handle:
+    json.dump({
+        "flavour": FLAVOUR,
+        "arch": ARCH,
+        "repeat": REPEAT,
+        "model_path": str(MODEL_PATH),
+        "threshold_smf": threshold_smf,
+        "max_ncalls": MAX_NCALLS,
+        "n_likelihood_calls": PROFILE["n_calls"],
+        "n_points_evaluated": int(np.sum(PROFILE["batch_sizes"])),
+        "device": device,
+    }, handle, indent=2)
